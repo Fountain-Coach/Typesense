@@ -62,7 +62,7 @@ jobs:
         run: |
           set -euxo pipefail
           if [[ -x "./build.sh" ]]; then
-            ./build.sh --package-binary
+            CXXFLAGS="$CXXFLAGS -Wno-error=redundant-move" ./build.sh --package-binary
             TAR="$(ls -1 build-*/${{ env.BIN_NAME }}-*.tar.gz | head -n1)"
             echo "TARBALL=$TAR" >> $GITHUB_ENV
           else
