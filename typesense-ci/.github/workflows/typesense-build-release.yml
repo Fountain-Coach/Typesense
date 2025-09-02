@@ -1,0 +1,115 @@
+
+name: build-and-release-typesense
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream Typesense ref (tag/branch/commit) to build"
+        required: true
+        default: "main"
+      create_release:
+        description: "Create a GitHub Release in this repo with the artifacts"
+        required: true
+        default: "true"
+  push:
+    tags:
+      - "typesense-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-22.04
+    env:
+      # Artifact naming
+      TARGET_ARCH: linux-amd64
+      BIN_NAME: typesense-server
+    steps:
+      - name: Checkout this repo
+      # (We publish releases to this repo, not upstream)
+        uses: actions/checkout@v4
+
+      - name: Determine ref to build
+        id: ref
+        run: |
+          # If this is a tag push that looks like typesense-v*, derive the upstream ref from the tag.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            # e.g. refs/tags/typesense-v29.1 -> typesense-v29.1
+            TAG="${{ github.ref_name }}"
+            echo "ref=${TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${{ github.event.inputs.ref }}" >> $GITHUB_OUTPUT
+          fi
+          echo "Using upstream ref: $(cat $GITHUB_OUTPUT)"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y             build-essential cmake ninja-build clang lld libdw-dev             curl zip
+
+      - name: Clone upstream Typesense
+        run: |
+          git clone https://github.com/typesense/typesense.git upstream-typesense
+          cd upstream-typesense
+          git fetch --all --tags --prune
+          git checkout "${{ steps.ref.outputs.ref }}" || (echo "Ref not found. Check the 'ref' input or push a tag like typesense-v29.1 that exists upstream." && exit 1)
+          git submodule update --init --recursive
+
+      - name: Build (prefer upstream build.sh packager)
+        working-directory: upstream-typesense
+        run: |
+          set -euxo pipefail
+          if [[ -x "./build.sh" ]]; then
+            ./build.sh --package-binary
+            TAR="$(ls -1 build-*/${{ env.BIN_NAME }}-*.tar.gz | head -n1)"
+            echo "TARBALL=$TAR" >> $GITHUB_ENV
+          else
+            echo "build.sh not found; attempting Bazel build"
+            # Install Bazelisk to get a recent Bazel
+            sudo curl -L https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 -o /usr/local/bin/bazel
+            sudo chmod +x /usr/local/bin/bazel
+            bazel build //:${{ env.BIN_NAME }} --verbose_failures --sandbox_debug
+            mkdir -p build-Linux
+            cp -v bazel-bin/${{ env.BIN_NAME }} build-Linux/
+            (cd build-Linux && tar -czf ${{ env.BIN_NAME }}-custom.tar.gz ${{ env.BIN_NAME }})
+            echo "TARBALL=$(pwd)/build-Linux/${{ env.BIN_NAME }}-custom.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Repack TARBALL into ZIP and generate checksums
+        working-directory: upstream-typesense
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          # Extract the binary from the tarball and zip it (Codex wants ZIP)
+          tar -xzf "${TARBALL}" -C artifact
+          cd artifact
+          if [[ ! -f "${{ env.BIN_NAME }}" ]]; then
+            echo "Expected binary ${{ env.BIN_NAME }} not found inside tarball"; ls -la; exit 1
+          fi
+          strip -s "${{ env.BIN_NAME }}" || true
+          zip -9 "${{ env.BIN_NAME }}-${{ steps.ref.outputs.ref }}-${{ env.TARGET_ARCH }}.zip" "${{ env.BIN_NAME }}"
+          sha256sum "${{ env.BIN_NAME }}-${{ steps.ref.outputs.ref }}-${{ env.TARGET_ARCH }}.zip" > SHA256SUMS.txt
+
+          echo "ZIP_PATH=$(pwd)/${{ env.BIN_NAME }}-${{ steps.ref.outputs.ref }}-${{ env.TARGET_ARCH }}.zip" >> $GITHUB_ENV
+          echo "SHA_PATH=$(pwd)/SHA256SUMS.txt" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: typesense-${{ steps.ref.outputs.ref }}-${{ env.TARGET_ARCH }}
+          path: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.SHA_PATH }}
+
+      - name: Create GitHub Release (tag push OR if workflow_dispatch + create_release=true)
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.create_release == 'true')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || steps.ref.outputs.ref }}
+          draft: false
+          prerelease: false
+          files: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.SHA_PATH }}
